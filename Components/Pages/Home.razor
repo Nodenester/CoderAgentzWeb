@@ -1,0 +1,990 @@
+@page "/"
+@using CoderAgentzWeb.Services
+@using Octokit
+@inject AgentTaskService TaskService
+@inject GitHubService GitHubService
+@inject TemplateService TemplateService
+@inject IHttpContextAccessor HttpContextAccessor
+@rendermode InteractiveServer
+@inject IJSRuntime JS
+
+<PageTitle>CoderAgentz - AI Coding Agent</PageTitle>
+
+@if (!IsAuthenticated)
+{
+    <div class="login-prompt">
+        <div class="logo-large">CoderAgentz</div>
+        <p>An autonomous AI coding agent that can clone your repos, make changes, test in browser, and push commits.</p>
+        <a href="/login" class="btn btn-lg btn-success">Login with GitHub</a>
+    </div>
+}
+else
+{
+    <div class="dashboard">
+        @if (!imageExists)
+        {
+            <div class="alert alert-warning">
+                Docker image 'coderagentz:latest' not found. Build it first.
+            </div>
+        }
+
+        @if (activeTask != null)
+        {
+            <!-- Active Task View with noVNC - Desktop: side by side -->
+            <div class="active-task-view">
+                <div class="task-header">
+                    <div class="task-info-header">
+                        <span class="task-title">@activeTask.RepoUrl.Split('/').LastOrDefault()</span>
+                        <span class="badge @activeTask.Status">@activeTask.Status</span>
+                    </div>
+                    <div class="task-controls">
+                        <button class="btn btn-sm btn-warning" @onclick="StopActiveTask">Stop</button>
+                        <button class="btn btn-sm btn-secondary" @onclick="CloseActiveTask">Close</button>
+                    </div>
+                </div>
+
+                <div class="task-content">
+                    <!-- Sidebar: Task Info & Logs -->
+                    <div class="task-sidebar">
+                        <div class="sidebar-section">
+                            <h4>Task Details</h4>
+                            <div class="detail-row">
+                                <span class="detail-label">Repository</span>
+                                <span class="detail-value">@activeTask.RepoUrl</span>
+                            </div>
+                            <div class="detail-row">
+                                <span class="detail-label">Branch</span>
+                                <span class="detail-value">@activeTask.BaseBranch</span>
+                            </div>
+                            <div class="detail-row">
+                                <span class="detail-label">Mode</span>
+                                <span class="detail-value">@activeTask.AgentMode.ToUpper()</span>
+                            </div>
+                            <div class="detail-row">
+                                <span class="detail-label">Started</span>
+                                <span class="detail-value">@activeTask.CreatedAt.ToLocalTime().ToString("HH:mm:ss")</span>
+                            </div>
+                        </div>
+
+                        <div class="sidebar-section task-description">
+                            <h4>Task Description</h4>
+                            <p>@activeTask.TaskDescription</p>
+                        </div>
+
+                        <div class="sidebar-section logs-section">
+                            <div class="logs-header">
+                                <h4>Logs</h4>
+                                <button class="btn btn-xs btn-outline" @onclick="RefreshLogs">Refresh</button>
+                            </div>
+                            <pre class="logs-output">@taskLogs</pre>
+                        </div>
+                    </div>
+
+                    <!-- Main: VNC Viewer -->
+                    <div class="vnc-container">
+                        <iframe src="http://localhost:@activeTask.NoVncPort/vnc.html?autoconnect=true&resize=scale"
+                                class="vnc-frame" allow="fullscreen"></iframe>
+                    </div>
+                </div>
+            </div>
+        }
+        else
+        {
+            <!-- New Task Form -->
+            <div class="card">
+                <h2>Start New Agent Task</h2>
+
+                <!-- Repository Selection -->
+                <div class="form-group">
+                    <label>Repository</label>
+                    @if (isLoadingRepos)
+                    {
+                        <div class="loading">Loading repositories...</div>
+                    }
+                    else
+                    {
+                        <input type="text" class="form-control" placeholder="Search repos..."
+                               @bind="repoSearch" @bind:event="oninput" />
+                        <div class="repo-list">
+                            @foreach (var repo in FilteredRepos.Take(10))
+                            {
+                                <div class="repo-item @(selectedRepo?.FullName == repo.FullName ? "selected" : "")"
+                                     @onclick="() => SelectRepo(repo)">
+                                    <span class="repo-name">@repo.Name</span>
+                                    <span class="repo-visibility">@(repo.Private ? "Private" : "Public")</span>
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+
+                @if (selectedRepo != null)
+                {
+                    <!-- Branch Selection -->
+                    <div class="form-group">
+                        <label>Branch</label>
+                        @if (isLoadingBranches)
+                        {
+                            <div class="loading">Loading branches...</div>
+                        }
+                        else
+                        {
+                            <select class="form-control" @bind="selectedBranch">
+                                @foreach (var branch in branches)
+                                {
+                                    <option value="@branch.Name">@branch.Name</option>
+                                }
+                            </select>
+                        }
+                    </div>
+
+                    <!-- Push to new branch (optional) -->
+                    <div class="form-group">
+                        <label>Create New Branch (optional - leave empty to push to @selectedBranch)</label>
+                        <input type="text" class="form-control" @bind="newTask.BranchName"
+                               placeholder="Leave empty to push to @selectedBranch" />
+                    </div>
+                }
+
+                <!-- Task Description -->
+                <div class="form-group">
+                    <label>Task Description *</label>
+                    <textarea class="form-control" @bind="newTask.TaskDescription" @bind:event="oninput" rows="3"
+                              placeholder="Describe what you want the agent to do..."></textarea>
+                </div>
+
+                <!-- Agent Mode -->
+                <div class="form-group">
+                    <label>Agent Mode</label>
+                    <div class="mode-toggle">
+                        <button class="@(newTask.AgentMode == "task" ? "active" : "")"
+                                @onclick='() => newTask.AgentMode = "task"'>Task</button>
+                        <button class="@(newTask.AgentMode == "pr" ? "active" : "")"
+                                @onclick='() => newTask.AgentMode = "pr"'>PR</button>
+                    </div>
+                </div>
+
+                <!-- Model Selection -->
+                <div class="form-group">
+                    <label>Claude Model</label>
+                    <div class="mode-toggle">
+                        <button class="@(newTask.Model == "haiku" ? "active" : "")"
+                                @onclick='() => newTask.Model = "haiku"'>Haiku (Fast)</button>
+                        <button class="@(newTask.Model == "sonnet" ? "active" : "")"
+                                @onclick='() => newTask.Model = "sonnet"'>Sonnet (Balanced)</button>
+                        <button class="@(newTask.Model == "opus" ? "active" : "")"
+                                @onclick='() => newTask.Model = "opus"'>Opus (Best)</button>
+                    </div>
+                </div>
+
+                <!-- CLAUDE.md Template -->
+                <div class="form-group">
+                    <label>
+                        CLAUDE.md / Credentials (paste login info here!)
+                        <button class="btn btn-xs btn-outline" @onclick="ToggleTemplates">
+                            @(showTemplates ? "Hide" : "Load")
+                        </button>
+                    </label>
+
+                    @if (showTemplates)
+                    {
+                        <div class="template-list">
+                            @foreach (var template in templates)
+                            {
+                                <div class="template-item">
+                                    <span @onclick="() => LoadTemplate(template)">@template.Name</span>
+                                    <button class="btn-icon" @onclick="() => DeleteTemplate(template.Id)">X</button>
+                                </div>
+                            }
+                            @if (!templates.Any())
+                            {
+                                <div class="template-empty">No saved templates</div>
+                            }
+                        </div>
+                    }
+
+                    <textarea id="claudeMdInput" class="form-control" rows="4"
+                              placeholder="Enter credentials here, e.g.:&#10;Username: test@example.com&#10;Password: mypassword"></textarea>
+                </div>
+
+                <button class="btn btn-primary btn-block" @onclick="StartTask" disabled="@(isStarting || selectedRepo == null)">
+                    @(isStarting ? "Starting..." : "Start Agent")
+                </button>
+
+                @if (!string.IsNullOrEmpty(errorMessage))
+                {
+                    <div class="alert alert-danger">@errorMessage</div>
+                }
+            </div>
+
+            <!-- Task History -->
+            @if (tasks.Any())
+            {
+                <div class="card">
+                    <h3>Recent Tasks</h3>
+                    <div class="task-list">
+                        @foreach (var task in tasks)
+                        {
+                            <div class="task-card @task.Status">
+                                <div class="task-info">
+                                    <strong>@task.RepoUrl.Split('/').LastOrDefault()</strong>
+                                    <span class="badge @task.Status">@task.Status</span>
+                                </div>
+                                <div class="task-desc">@task.TaskDescription</div>
+                                <div class="task-actions">
+                                    @if (task.Status == "running")
+                                    {
+                                        <button class="btn btn-xs btn-success" @onclick="() => ViewTask(task)">View</button>
+                                        <button class="btn btn-xs btn-warning" @onclick="() => StopTask(task.Id)">Stop</button>
+                                    }
+                                    <button class="btn btn-xs btn-danger" @onclick="() => RemoveTask(task.Id)">Remove</button>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                </div>
+            }
+        }
+    </div>
+}
+
+@code {
+    private bool IsAuthenticated => HttpContextAccessor.HttpContext?.User?.Identity?.IsAuthenticated == true;
+    private string? UserName => HttpContextAccessor.HttpContext?.User?.Identity?.Name;
+    private string? GitHubToken => HttpContextAccessor.HttpContext?.User?.FindFirst("access_token")?.Value;
+
+    private AgentTask newTask = new();
+    private List<AgentTask> tasks = new();
+    private AgentTask? activeTask;
+    private string taskLogs = "";
+    private bool isStarting;
+    private bool imageExists = true;
+    private string errorMessage = "";
+
+    // Repos & Branches
+    private List<Repository> repositories = new();
+    private List<Branch> branches = new();
+    private Repository? selectedRepo;
+    private string selectedBranch = "main";
+    private string repoSearch = "";
+    private bool isLoadingRepos;
+    private bool isLoadingBranches;
+
+    // Templates
+    private List<ClaudeTemplate> templates = new();
+    private bool showTemplates;
+    private string newTemplateName = "";
+
+    private IEnumerable<Repository> FilteredRepos => string.IsNullOrWhiteSpace(repoSearch)
+        ? repositories
+        : repositories.Where(r => r.FullName.Contains(repoSearch, StringComparison.OrdinalIgnoreCase));
+
+    protected override async Task OnInitializedAsync()
+    {
+        newTask.BaseBranch = "main";
+        newTask.AgentMode = "task";
+        newTask.Model = "sonnet";
+
+        if (IsAuthenticated && !string.IsNullOrEmpty(GitHubToken))
+        {
+            imageExists = await TaskService.CheckDockerImageAsync();
+            RefreshTasks();
+            await LoadRepositories();
+            await LoadTemplates();
+        }
+    }
+
+    private async Task LoadRepositories()
+    {
+        if (string.IsNullOrEmpty(GitHubToken)) return;
+
+        isLoadingRepos = true;
+        StateHasChanged();
+
+        try
+        {
+            repositories = (await GitHubService.GetUserRepositoriesAsync(GitHubToken)).ToList();
+        }
+        catch { }
+        finally
+        {
+            isLoadingRepos = false;
+        }
+    }
+
+    private async Task SelectRepo(Repository repo)
+    {
+        selectedRepo = repo;
+        newTask.RepoUrl = repo.CloneUrl ?? $"https://github.com/{repo.FullName}";
+        newTask.BaseBranch = repo.DefaultBranch ?? "main";
+        selectedBranch = repo.DefaultBranch ?? "main";
+
+        await LoadBranches();
+    }
+
+    private async Task LoadBranches()
+    {
+        if (selectedRepo == null || string.IsNullOrEmpty(GitHubToken)) return;
+
+        isLoadingBranches = true;
+        StateHasChanged();
+
+        try
+        {
+            branches = (await GitHubService.GetBranchesAsync(GitHubToken, selectedRepo.Owner.Login, selectedRepo.Name)).ToList();
+        }
+        catch { }
+        finally
+        {
+            isLoadingBranches = false;
+        }
+    }
+
+    private async Task LoadTemplates()
+    {
+        if (string.IsNullOrEmpty(UserName)) return;
+        templates = await TemplateService.GetUserTemplatesAsync(UserName);
+    }
+
+    private void ToggleTemplates() => showTemplates = !showTemplates;
+
+    private void LoadTemplate(ClaudeTemplate template)
+    {
+        newTask.ClaudeMd = template.Content;
+        showTemplates = false;
+    }
+
+    private async Task SaveTemplate()
+    {
+        if (string.IsNullOrEmpty(UserName) || string.IsNullOrWhiteSpace(newTemplateName)) return;
+
+        await TemplateService.SaveTemplateAsync(UserName, new ClaudeTemplate
+        {
+            Name = newTemplateName,
+            Content = newTask.ClaudeMd ?? ""
+        });
+
+        newTemplateName = "";
+        await LoadTemplates();
+    }
+
+    private async Task DeleteTemplate(string id)
+    {
+        if (string.IsNullOrEmpty(UserName)) return;
+        await TemplateService.DeleteTemplateAsync(UserName, id);
+        await LoadTemplates();
+    }
+
+    private void RefreshTasks()
+    {
+        if (UserName != null)
+            tasks = TaskService.GetUserTasks(UserName).ToList();
+    }
+
+    private async Task StartTask()
+    {
+        errorMessage = "";
+
+        if (selectedRepo == null)
+        {
+            errorMessage = "Select a repository";
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(newTask.TaskDescription))
+        {
+            errorMessage = "Task description is required";
+            return;
+        }
+
+        if (string.IsNullOrEmpty(GitHubToken))
+        {
+            errorMessage = "GitHub token not available. Please re-login.";
+            return;
+        }
+
+        isStarting = true;
+        StateHasChanged();
+
+        try
+        {
+            // Read ClaudeMd from JavaScript (bypasses Blazor binding issues)
+            newTask.ClaudeMd = await JS.InvokeAsync<string>("eval", "document.getElementById('claudeMdInput')?.value || ''");
+
+            newTask.GitHubToken = GitHubToken;
+            newTask.UserName = UserName;
+            newTask.BaseBranch = selectedBranch;
+
+            var task = await TaskService.CreateAndStartTaskAsync(newTask);
+            activeTask = task;
+            taskLogs = "Container starting...";
+
+            newTask = new AgentTask { BaseBranch = "main", AgentMode = "task", Model = "sonnet" };
+            selectedRepo = null;
+            RefreshTasks();
+        }
+        catch (Exception ex)
+        {
+            errorMessage = ex.Message;
+        }
+        finally
+        {
+            isStarting = false;
+        }
+    }
+
+    private async Task RefreshLogs()
+    {
+        if (activeTask != null)
+        {
+            taskLogs = await TaskService.GetTaskLogsAsync(activeTask.Id);
+            var state = await TaskService.GetTaskStateAsync(activeTask.Id);
+            activeTask.Status = state.Status;
+        }
+    }
+
+    private void ViewTask(AgentTask task)
+    {
+        activeTask = task;
+        _ = RefreshLogs();
+    }
+
+    private void CloseActiveTask()
+    {
+        activeTask = null;
+        taskLogs = "";
+        RefreshTasks();
+    }
+
+    private async Task StopActiveTask()
+    {
+        if (activeTask != null)
+        {
+            await TaskService.StopTaskAsync(activeTask.Id);
+            await RefreshLogs();
+        }
+    }
+
+    private async Task StopTask(string taskId)
+    {
+        await TaskService.StopTaskAsync(taskId);
+        RefreshTasks();
+    }
+
+    private async Task RemoveTask(string taskId)
+    {
+        await TaskService.RemoveTaskAsync(taskId);
+        RefreshTasks();
+    }
+}
+
+<style>
+    /* Mobile-first responsive design */
+    * { box-sizing: border-box; }
+
+    .login-prompt {
+        text-align: center;
+        padding: 2rem 1rem;
+        max-width: 400px;
+        margin: 0 auto;
+    }
+
+    .logo-large {
+        font-size: 2rem;
+        font-weight: bold;
+        color: #58a6ff;
+        margin-bottom: 1rem;
+    }
+
+    .login-prompt p {
+        color: #8b949e;
+        margin-bottom: 2rem;
+        line-height: 1.5;
+    }
+
+    .dashboard {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 0 1rem;
+    }
+
+    .card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 1.5rem;
+        margin-bottom: 1rem;
+    }
+
+    .card h2, .card h3 {
+        color: #58a6ff;
+        margin: 0 0 1rem 0;
+        font-size: 1.25rem;
+    }
+
+    .form-group {
+        margin-bottom: 1rem;
+    }
+
+    .form-group label {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.5rem;
+        color: #8b949e;
+        font-size: 0.9rem;
+    }
+
+    .form-control {
+        width: 100%;
+        padding: 0.75rem;
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        color: #c9d1d9;
+        font-size: 16px; /* Prevents zoom on iOS */
+    }
+
+    .form-control:focus {
+        outline: none;
+        border-color: #58a6ff;
+    }
+
+    .form-control-sm {
+        padding: 0.5rem;
+        font-size: 14px;
+        flex: 1;
+    }
+
+    .loading {
+        color: #8b949e;
+        padding: 0.5rem;
+        font-size: 0.9rem;
+    }
+
+    /* Repo List */
+    .repo-list {
+        max-height: 200px;
+        overflow-y: auto;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        margin-top: 0.5rem;
+    }
+
+    .repo-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.75rem;
+        border-bottom: 1px solid #30363d;
+        cursor: pointer;
+    }
+
+    .repo-item:last-child { border-bottom: none; }
+
+    .repo-item:hover, .repo-item.selected {
+        background: #21262d;
+    }
+
+    .repo-item.selected {
+        border-left: 3px solid #58a6ff;
+    }
+
+    .repo-name {
+        font-weight: 500;
+        color: #c9d1d9;
+    }
+
+    .repo-visibility {
+        font-size: 0.75rem;
+        color: #8b949e;
+        padding: 0.2rem 0.5rem;
+        background: #30363d;
+        border-radius: 4px;
+    }
+
+    /* Mode Toggle */
+    .mode-toggle {
+        display: flex;
+        gap: 0;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        overflow: hidden;
+    }
+
+    .mode-toggle button {
+        flex: 1;
+        padding: 0.75rem;
+        background: #0d1117;
+        border: none;
+        color: #8b949e;
+        cursor: pointer;
+        font-size: 0.9rem;
+    }
+
+    .mode-toggle button.active {
+        background: #238636;
+        color: white;
+    }
+
+    /* Templates */
+    .template-list {
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        margin-bottom: 0.5rem;
+        max-height: 150px;
+        overflow-y: auto;
+    }
+
+    .template-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid #30363d;
+        cursor: pointer;
+    }
+
+    .template-item:hover { background: #21262d; }
+    .template-item:last-child { border-bottom: none; }
+
+    .template-empty {
+        padding: 0.75rem;
+        color: #8b949e;
+        text-align: center;
+        font-size: 0.9rem;
+    }
+
+    .template-save {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+    }
+
+    /* Buttons */
+    .btn {
+        padding: 0.75rem 1rem;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+        font-weight: 500;
+        font-size: 1rem;
+        text-decoration: none;
+        display: inline-block;
+        text-align: center;
+    }
+
+    .btn-block { width: 100%; }
+    .btn-lg { padding: 1rem 1.5rem; font-size: 1.1rem; }
+    .btn-sm { padding: 0.5rem 0.75rem; font-size: 0.9rem; }
+    .btn-xs { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
+
+    .btn-primary { background: #238636; color: white; }
+    .btn-primary:hover { background: #2ea043; }
+    .btn-primary:disabled { background: #30363d; cursor: not-allowed; }
+
+    .btn-success { background: #238636; color: white; }
+    .btn-warning { background: #d29922; color: black; }
+    .btn-danger { background: #f85149; color: white; }
+    .btn-secondary { background: #30363d; color: #c9d1d9; }
+    .btn-outline { background: transparent; border: 1px solid #30363d; color: #c9d1d9; }
+    .btn-outline:hover { background: #30363d; }
+
+    .btn-icon {
+        background: none;
+        border: none;
+        color: #8b949e;
+        cursor: pointer;
+        padding: 0.25rem;
+    }
+
+    .btn-icon:hover { color: #f85149; }
+
+    /* Alerts */
+    .alert {
+        padding: 0.75rem 1rem;
+        border-radius: 6px;
+        margin-top: 1rem;
+        font-size: 0.9rem;
+    }
+
+    .alert-warning {
+        background: #422006;
+        border: 1px solid #d97706;
+        color: #fbbf24;
+    }
+
+    .alert-danger {
+        background: #3b0f0f;
+        border: 1px solid #f85149;
+        color: #f85149;
+    }
+
+    /* Task List */
+    .task-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+
+    .task-card {
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 0.75rem;
+    }
+
+    .task-card.running { border-color: #238636; }
+
+    .task-info {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.5rem;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+    }
+
+    .badge {
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        background: #30363d;
+    }
+
+    .badge.running { background: #238636; }
+    .badge.stopped { background: #d29922; color: black; }
+    .badge.exited { background: #30363d; }
+
+    .task-desc {
+        color: #8b949e;
+        font-size: 0.85rem;
+        margin-bottom: 0.5rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .task-actions {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+    }
+
+    /* Active Task View */
+    .active-task-view {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        overflow: hidden;
+        height: calc(100vh - 120px);
+        display: flex;
+        flex-direction: column;
+    }
+
+    .task-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.75rem 1rem;
+        background: #0d1117;
+        border-bottom: 1px solid #30363d;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        flex-shrink: 0;
+    }
+
+    .task-info-header {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        flex: 1;
+        min-width: 0;
+    }
+
+    .task-title {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: #58a6ff;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .task-controls {
+        display: flex;
+        gap: 0.5rem;
+        flex-shrink: 0;
+    }
+
+    .task-content {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        overflow: hidden;
+    }
+
+    .task-sidebar {
+        padding: 1rem;
+        background: #0d1117;
+        border-bottom: 1px solid #30363d;
+        overflow-y: auto;
+    }
+
+    .sidebar-section {
+        margin-bottom: 1rem;
+    }
+
+    .sidebar-section:last-child {
+        margin-bottom: 0;
+    }
+
+    .sidebar-section h4 {
+        color: #8b949e;
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin: 0 0 0.5rem 0;
+    }
+
+    .detail-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 0.25rem 0;
+        font-size: 0.85rem;
+        border-bottom: 1px solid #21262d;
+    }
+
+    .detail-label {
+        color: #8b949e;
+    }
+
+    .detail-value {
+        color: #c9d1d9;
+        text-align: right;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 60%;
+    }
+
+    .task-description p {
+        color: #c9d1d9;
+        font-size: 0.9rem;
+        line-height: 1.4;
+        margin: 0;
+    }
+
+    .vnc-container {
+        flex: 1;
+        min-height: 200px;
+        background: #000;
+    }
+
+    .vnc-frame {
+        width: 100%;
+        height: 100%;
+        border: none;
+    }
+
+    .logs-section {
+        padding: 0;
+        border-top: none;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 150px;
+    }
+
+    .logs-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.5rem;
+    }
+
+    .logs-header h4 {
+        margin: 0;
+    }
+
+    .logs-output {
+        background: #161b22;
+        padding: 0.75rem;
+        border-radius: 6px;
+        flex: 1;
+        overflow: auto;
+        font-size: 0.75rem;
+        font-family: 'Consolas', 'Monaco', monospace;
+        color: #8b949e;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        margin: 0;
+        border: 1px solid #30363d;
+    }
+
+    /* Tablet and up */
+    @@media (min-width: 768px) {
+        .login-prompt { padding: 4rem 2rem; }
+        .logo-large { font-size: 2.5rem; }
+        .dashboard { padding: 0 2rem; }
+        .logs-output { max-height: 300px; }
+    }
+
+    /* Desktop - Side by side layout */
+    @@media (min-width: 1024px) {
+        .dashboard {
+            max-width: 100%;
+            padding: 0 1.5rem;
+        }
+
+        .active-task-view {
+            height: calc(100vh - 80px);
+        }
+
+        .task-content {
+            flex-direction: row;
+        }
+
+        .task-sidebar {
+            width: 380px;
+            flex-shrink: 0;
+            border-bottom: none;
+            border-right: 1px solid #30363d;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        .sidebar-section {
+            flex-shrink: 0;
+        }
+
+        .logs-section {
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .logs-output {
+            flex: 1;
+            max-height: none;
+            overflow-y: auto;
+        }
+
+        .vnc-container {
+            flex: 1;
+            min-height: 100%;
+        }
+    }
+
+    /* Large desktop */
+    @@media (min-width: 1400px) {
+        .task-sidebar {
+            width: 450px;
+        }
+    }
+</style>

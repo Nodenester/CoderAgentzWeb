@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+*.user
+.env
+output/
+data/
+app.log
+nul
+*.pdb

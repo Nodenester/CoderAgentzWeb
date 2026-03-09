@@ -1,0 +1,24 @@
+services:
+  coderagentz-web:
+    build: .
+    image: coderagentz-web:latest
+    container_name: coderagentz-web
+    ports:
+      - "7200:80"
+    environment:
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      - OUTPUT_PATH=/app/output
+      - TEMPLATES_PATH=/app/data/templates
+      # CLAUDE_HOST_PATH must be the HOST path (not container path) for bind mounts
+      - CLAUDE_HOST_PATH=${CLAUDE_HOST_PATH:-/c/Users/nestor/.claude}
+    volumes:
+      # Mount Docker socket so we can control containers on the host
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Output logs (shared with agent containers)
+      - ./output:/app/output:rw
+      # Persistent data (templates per user)
+      - ./data:/app/data:rw
+      # Claude credentials (read-only)
+      - ~/.claude:/claude-config:ro
+    restart: unless-stopped
